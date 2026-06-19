@@ -1,0 +1,357 @@
+"""
+3D Compressed Air Engine with Video Output for Google Colab 
+"""
+
+import subprocess
+import sys
+
+print("Installing required packages...")
+subprocess.check_call([sys.executable, "-m", "pip", "install", "pybullet", "-q"])
+subprocess.check_call([sys.executable, "-m", "pip", "install", "numpy", "-q"])
+subprocess.check_call([sys.executable, "-m", "pip", "install", "matplotlib", "-q"])
+subprocess.check_call([sys.executable, "-m", "pip", "install", "opencv-python", "-q"])
+subprocess.check_call([sys.executable, "-m", "pip", "install", "pillow", "-q"])
+print("✓ All packages installed!")
+
+import pybullet as p
+import pybullet_data
+import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+from PIL import Image, ImageDraw
+import os
+
+class CompressedAirEngine3DVideo:
+    def __init__(self):
+        """Initialize the 3D compressed air engine simulation with video"""
+        self.client = p.connect(p.DIRECT)
+        
+        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        p.setGravity(0, 0, -9.81)
+        
+        self.planeId = p.loadURDF("plane.urdf")
+        
+        self.piston_mass = 0.5
+        self.cylinder_radius = 0.15
+        self.piston_travel = 0.8
+        self.air_pressure = 5.0
+        self.air_supply = 100.0
+        self.crankshaft_rpm = 600
+        
+        self.video_width = 1280
+        self.video_height = 720
+        self.fps = 30
+        self.frames = []
+        
+        self.create_3d_engine()
+        
+        self.piston_positions = []
+        self.crankshaft_angles = []
+        self.piston_velocities = []
+        self.output_force_log = []
+        self.time_log = []
+        
+    def create_3d_engine(self):
+        """Create realistic 3D engine geometry"""
+        
+        print("Creating 3D engine components...")
+        
+        # CYLINDER BLOCK
+        cylinder_shape = p.createCollisionShape(p.GEOM_CYLINDER, radius=self.cylinder_radius, height=self.piston_travel)
+        self.cylinderId = p.createMultiBody(baseMass=2.0, baseCollisionShapeIndex=cylinder_shape, basePosition=[0, 0, 0])
+        p.changeVisualShape(self.cylinderId, -1, rgbaColor=[0.6, 0.6, 0.6, 1])
+        
+        # PISTON
+        piston_shape = p.createCollisionShape(p.GEOM_CYLINDER, radius=self.cylinder_radius * 0.95, height=0.12)
+        self.pistonId = p.createMultiBody(baseMass=self.piston_mass, baseCollisionShapeIndex=piston_shape, basePosition=[0, 0, -self.piston_travel/2])
+        p.changeVisualShape(self.pistonId, -1, rgbaColor=[1, 0.2, 0.2, 1])
+        p.resetBaseVelocity(self.pistonId, linearVelocity=[0, 0, 0])
+        
+        # CONNECTING ROD
+        rod_shape = p.createCollisionShape(p.GEOM_CYLINDER, radius=0.03, height=0.6)
+        self.rodId = p.createMultiBody(baseMass=0.3, baseCollisionShapeIndex=rod_shape, basePosition=[0, 0.3, 0])
+        p.changeVisualShape(self.rodId, -1, rgbaColor=[0.7, 0.4, 0.2, 1])
+        
+        p.createConstraint(self.pistonId, -1, self.rodId, -1, p.JOINT_FIXED, [0, 0, 1], [0, 0, 0.06], [0, 0, -0.3])
+        
+        # CRANKSHAFT
+        crank_shape = p.createCollisionShape(p.GEOM_CYLINDER, radius=0.025, height=0.5)
+        self.crankshaftId = p.createMultiBody(baseMass=0.4, baseCollisionShapeIndex=crank_shape, basePosition=[0, 0, 0.4])
+        p.changeVisualShape(self.crankshaftId, -1, rgbaColor=[0.1, 0.1, 0.1, 1])
+        
+        p.createConstraint(self.rodId, -1, self.crankshaftId, -1, p.JOINT_POINT2POINT, [0, 0, 0], [0, 0.3, 0], [0, 0.2, 0])
+        
+        # CRANKCASE
+        case_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.25, 0.25, 0.2])
+        self.crankcase = p.createMultiBody(baseMass=1.0, baseCollisionShapeIndex=case_shape, basePosition=[0, 0, -0.6])
+        p.changeVisualShape(self.crankcase, -1, rgbaColor=[0.3, 0.3, 0.3, 0.8])
+        
+        # INTAKE VALVE
+        intake_shape = p.createCollisionShape(p.GEOM_SPHERE, radius=0.05)
+        self.intake_valve = p.createMultiBody(baseMass=0.01, baseCollisionShapeIndex=intake_shape, basePosition=[-0.25, 0, 0.5])
+        p.changeVisualShape(self.intake_valve, -1, rgbaColor=[0, 1, 0, 0.9])
+        
+        # EXHAUST VALVE
+        exhaust_shape = p.createCollisionShape(p.GEOM_SPHERE, radius=0.05)
+        self.exhaust_valve = p.createMultiBody(baseMass=0.01, baseCollisionShapeIndex=exhaust_shape, basePosition=[0.25, 0, 0.5])
+        p.changeVisualShape(self.exhaust_valve, -1, rgbaColor=[1, 0.2, 0.2, 0.9])
+        
+        # FLYWHEEL
+        flywheel_shape = p.createCollisionShape(p.GEOM_CYLINDER, radius=0.35, height=0.1)
+        self.flywheel = p.createMultiBody(baseMass=2.5, baseCollisionShapeIndex=flywheel_shape, basePosition=[0, 0, 0.85])
+        p.changeVisualShape(self.flywheel, -1, rgbaColor=[0.4, 0.4, 0.4, 1])
+        
+        p.createConstraint(self.crankshaftId, -1, self.flywheel, -1, p.JOINT_FIXED, [0, 0, 1], [0, 0, -0.2], [0, 0, -0.05])
+        
+        print("✓ 3D engine created successfully!")
+        
+    def calculate_air_force(self, piston_pos, cycle_phase):
+        norm_pos = (piston_pos + self.piston_travel/2) / self.piston_travel
+        norm_pos = np.clip(norm_pos, 0, 1)
+        
+        if cycle_phase < 0.25:
+            self.air_supply = min(self.air_supply + 10, 100)
+        elif 0.25 <= cycle_phase < 0.5:
+            self.air_supply *= 0.98
+        elif 0.5 <= cycle_phase < 0.75:
+            force = self.air_pressure * self.air_supply * (1 - norm_pos)
+            self.air_supply *= 0.95
+            return force
+        else:
+            self.air_supply = max(self.air_supply - 5, 0)
+        
+        return 0
+    
+    def apply_crankshaft_rotation(self, dt):
+        omega = (self.crankshaft_rpm * 2 * np.pi) / 60
+        p.applyExternalTorque(self.crankshaftId, -1, [0, 0, omega * 0.1], p.WORLD_FRAME)
+    
+    def simulate_step(self, dt, cycle_phase):
+        piston_pos, _ = p.getBasePositionAndOrientation(self.pistonId)
+        piston_lin_vel, _ = p.getBaseVelocity(self.pistonId)
+        
+        crank_pos, crank_orn = p.getBasePositionAndOrientation(self.crankshaftId)
+        crank_angle = p.getEulerFromQuaternion(crank_orn)[2]
+        
+        air_force = self.calculate_air_force(piston_pos[2], cycle_phase)
+        
+        if air_force > 0:
+            p.applyExternalForce(self.pistonId, -1, [0, 0, air_force], [0, 0, 0], p.WORLD_FRAME)
+        
+        damping_force = -piston_lin_vel[2] * 1.5
+        p.applyExternalForce(self.pistonId, -1, [0, 0, damping_force], [0, 0, 0], p.WORLD_FRAME)
+        
+        self.apply_crankshaft_rotation(dt)
+        
+        if piston_pos[2] > self.piston_travel/2:
+            p.resetBaseVelocity(self.pistonId, linearVelocity=[0, 0, -0.2])
+        elif piston_pos[2] < -self.piston_travel/2:
+            p.resetBaseVelocity(self.pistonId, linearVelocity=[0, 0, 0.2])
+        
+        p.stepSimulation()
+        
+        return piston_pos[2], piston_lin_vel[2], air_force, crank_angle
+    
+    def capture_frame(self, time_sim, cycle_phase, piston_pos, piston_vel, air_force):
+        """Capture 3D frame - FIXED with upAxisIndex"""
+        
+        yaw = 45 + np.degrees(self.crankshaft_angles[-1])
+        
+        # ✅ FIXED: Added upAxisIndex=2 parameter
+        view_matrix = p.computeViewMatrixFromYawPitchRoll(
+            cameraTargetPosition=[0, 0, 0.1],
+            distance=2.2,
+            yaw=yaw,
+            pitch=-25,
+            roll=0,
+            upAxisIndex=2  # ← THIS WAS MISSING
+        )
+        
+        proj_matrix = p.computeProjectionMatrixFOV(
+            fov=60,
+            aspect=float(self.video_width) / self.video_height,
+            nearVal=0.1,
+            farVal=100
+        )
+        
+        try:
+            w, h, rgb, depth, mask = p.getCameraImage(
+                self.video_width, self.video_height,
+                view_matrix, proj_matrix,
+                renderer=p.ER_BULLET_HARDWARE_OPENGL
+            )
+            
+            frame = np.array(rgb)
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+            frame = self.add_hud(frame, time_sim, cycle_phase, piston_pos, piston_vel, air_force)
+            self.frames.append(frame)
+            
+        except Exception as e:
+            print(f"Warning: Could not capture frame: {e}")
+    
+    def add_hud(self, frame, time_sim, cycle_phase, piston_pos, piston_vel, air_force):
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.8
+        font_thickness = 2
+        text_color = (255, 255, 255)
+        
+        y_offset = 35
+        info = [
+            f"TIME: {time_sim:.2f}s",
+            f"RPM: {self.crankshaft_rpm}",
+            f"CYCLE: {['INTAKE', 'COMPRESSION', 'POWER', 'EXHAUST'][int(cycle_phase*4)]}",
+            f"PISTON POS: {piston_pos:.3f}m",
+            f"PISTON VEL: {piston_vel:.3f}m/s",
+            f"AIR FORCE: {air_force:.2f}N",
+        ]
+        
+        for i, text in enumerate(info):
+            y = y_offset + i * 30
+            cv2.putText(frame, text, (15, y), font, font_scale, (0, 0, 0), font_thickness + 1)
+            cv2.putText(frame, text, (15, y), font, font_scale, text_color, font_thickness)
+        
+        spec = [
+            "3D Compressed Air Engine | PyBullet Physics",
+            f"Cylinder: {self.cylinder_radius*100:.1f}cm | Pressure: {self.air_pressure}bar",
+        ]
+        
+        y_offset = self.video_height - 50
+        for i, text in enumerate(spec):
+            y = y_offset + i * 25
+            cv2.putText(frame, text, (15, y), font, font_scale*0.75, (0, 0, 0), font_thickness)
+            cv2.putText(frame, text, (15, y), font, font_scale*0.75, (200, 200, 200), 1)
+        
+        return frame
+    
+    def run_simulation_with_video(self, duration=15):
+        dt = 1.0 / 240.0
+        num_sim_steps = int(duration * 240)
+        video_frame_interval = 240 // self.fps
+        cycle_duration = 4.0
+        
+        print(f"\nRunning 3D simulation for {duration} seconds...")
+        print(f"Capturing video at {self.fps} FPS (1280x720)...")
+        
+        for step in range(num_sim_steps):
+            time_sim = step * dt
+            cycle_phase = (time_sim % cycle_duration) / cycle_duration
+            
+            pos, vel, force, crank_angle = self.simulate_step(dt, cycle_phase)
+            
+            self.time_log.append(time_sim)
+            self.piston_positions.append(pos)
+            self.piston_velocities.append(vel)
+            self.output_force_log.append(force)
+            self.crankshaft_angles.append(crank_angle)
+            
+            if step % video_frame_interval == 0:
+                self.capture_frame(time_sim, cycle_phase, pos, vel, force)
+            
+            if (step + 1) % 600 == 0:
+                print(f"  Physics: {(step + 1) / num_sim_steps * 100:.0f}% | Frames: {len(self.frames)}")
+        
+        print(f"✓ Captured {len(self.frames)} frames")
+    
+    def save_video(self, output_path="engine_3d.mp4"):
+        if not self.frames:
+            print("No frames to save!")
+            return
+        
+        print(f"\nSaving video to '{output_path}'...")
+        
+        height, width = self.frames[0].shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, self.fps, (width, height))
+        
+        total_frames = len(self.frames)
+        for i, frame in enumerate(self.frames):
+            out.write(frame)
+            if (i + 1) % max(1, total_frames // 5) == 0:
+                print(f"  Encoding: {(i + 1) / total_frames * 100:.0f}%")
+        
+        out.release()
+        print(f"✓ Video saved!")
+        
+        file_size = os.path.getsize(output_path) / (1024 * 1024)
+        print(f"  File: {output_path}")
+        print(f"  Size: {file_size:.2f} MB")
+    
+    def get_statistics(self):
+        stats = {
+            'max_piston_velocity': max(self.piston_velocities) if self.piston_velocities else 0,
+            'avg_piston_velocity': np.mean(self.piston_velocities) if self.piston_velocities else 0,
+            'max_force': max(self.output_force_log) if self.output_force_log else 0,
+            'avg_force': np.mean(self.output_force_log) if self.output_force_log else 0,
+            'frames_captured': len(self.frames),
+        }
+        return stats
+    
+    def plot_results(self):
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        fig.suptitle("3D Engine Simulation Results", fontsize=16, fontweight='bold')
+        
+        axes[0, 0].plot(self.time_log, self.piston_positions, 'b-', linewidth=2.5)
+        axes[0, 0].set_xlabel('Time (s)', fontweight='bold')
+        axes[0, 0].set_ylabel('Position (m)', fontweight='bold')
+        axes[0, 0].set_title('Piston Motion', fontweight='bold')
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        axes[0, 1].plot(self.time_log, self.piston_velocities, 'r-', linewidth=2.5)
+        axes[0, 1].set_xlabel('Time (s)', fontweight='bold')
+        axes[0, 1].set_ylabel('Velocity (m/s)', fontweight='bold')
+        axes[0, 1].set_title('Piston Velocity', fontweight='bold')
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        axes[1, 0].plot(self.time_log, self.output_force_log, 'g-', linewidth=2.5)
+        axes[1, 0].fill_between(self.time_log, 0, self.output_force_log, alpha=0.3, color='green')
+        axes[1, 0].set_xlabel('Time (s)', fontweight='bold')
+        axes[1, 0].set_ylabel('Force (N)', fontweight='bold')
+        axes[1, 0].set_title('Air Force Output', fontweight='bold')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        axes[1, 1].plot(self.time_log, np.degrees(self.crankshaft_angles), 'orange', linewidth=2.5)
+        axes[1, 1].set_xlabel('Time (s)', fontweight='bold')
+        axes[1, 1].set_ylabel('Angle (degrees)', fontweight='bold')
+        axes[1, 1].set_title('Crankshaft Rotation', fontweight='bold')
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def disconnect(self):
+        p.disconnect()
+
+print("\n" + "="*70)
+print("3D COMPRESSED AIR ENGINE - VIDEO GENERATOR (FIXED)")
+print("="*70)
+
+print("\n✓ Initializing 3D engine...")
+engine = CompressedAirEngine3DVideo()
+
+print("\n✓ Starting simulation with video capture...")
+engine.run_simulation_with_video(duration=12)
+
+stats = engine.get_statistics()
+print("\n" + "="*70)
+print("SIMULATION STATISTICS")
+print("="*70)
+print(f"Total Frames:          {stats['frames_captured']}")
+print(f"Max Piston Velocity:   {stats['max_piston_velocity']:.4f} m/s")
+print(f"Avg Piston Velocity:   {stats['avg_piston_velocity']:.4f} m/s")
+print(f"Max Output Force:      {stats['max_force']:.4f} N")
+print(f"Avg Output Force:      {stats['avg_force']:.4f} N")
+print("="*70)
+
+output_file = "engine_3d_simulation.mp4"
+engine.save_video(output_file)
+
+print("\n✓ Generating graphs...")
+engine.plot_results()
+
+engine.disconnect()
+
+print("\n" + "="*70)
+print("✓ COMPLETE!")
+print("="*70)
+print(f"\n📥 Download '{output_file}' from Files section")
+print("="*70 + "\n")
